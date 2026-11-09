@@ -1,0 +1,161 @@
+# Mola'yı derleyip TestFlight'a (yalnızca iç test) yükler.
+#
+# Kaynak private depoda durur. Bu dosyanın bir kopyası yalnızca workflow içeren public CI deposunda
+# (ataberkus/mola-ios-build) bulunur ve kaynağı orada salt okunur deploy key ile checkout eder. Public
+# depoda çalıştığı için adımlar kaynak yazdırmaz, artifact yüklemez ve xcodebuild sessiz çalışır.
+# Değişikliği önce burada yapın, sonra public depoya kopyalayın.
+#   gh workflow run testflight.yml -R ataberkus/mola-ios-build -f ref=<40 karakterlik commit SHA ya da dal>
+#
+# Gerekenler (README › "TestFlight"):
+#   Variable: MOLA_SOURCE_REPO (public depoda; aynı depoda çalışırken tanımlanmaz)
+#   Secrets : MOLA_DEPLOY_KEY (yalnızca public depoda), APPLE_TEAM_ID, ASC_KEY_ID, ASC_ISSUER_ID, ASC_KEY_P8,
+#             IOS_DIST_CERT_P12, IOS_DIST_CERT_PASSWORD, IOS_PROVISIONING_PROFILE
+# Profil com.apple.developer.carplay-video içeriyorsa MOLA_CARPLAY=YES ile, içermiyorsa CarPlay yetkisi olmadan arşivler.
+name: TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Kaynak deposunun dalı, etiketi ya da tam commit SHA'sı
+        required: true
+        default: main
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  testflight:
+    # Xcode 27 şimdilik public preview etiketiyle sunuluyor (actions/runner-images#14404).
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - name: Kaynağı checkout et (aynı depo)
+        if: ${{ vars.MOLA_SOURCE_REPO == '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Kaynağı checkout et (private depo, salt okunur deploy key)
+        if: ${{ vars.MOLA_SOURCE_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.MOLA_SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MOLA_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Commit ve Xcode
+        run: |
+          git log -1 --format='%h %s'
+          xcodebuild -version
+          xcodebuild -version | head -n1 | grep -q "Xcode 27" || { echo "::error::Runner'da Xcode 27 yok"; exit 1; }
+
+      - name: XcodeGen
+        run: brew install xcodegen
+
+      - name: MolaCore swift test
+        run: |
+          set -o pipefail
+          swift test --package-path Packages/MolaCore 2>&1 | tail -3
+
+      - name: Projeyi üret
+        run: xcodegen generate --quiet
+
+      - name: İmza sertifikasını ve profili kur
+        id: install
+        env:
+          IOS_DIST_CERT_P12: ${{ secrets.IOS_DIST_CERT_P12 }}
+          IOS_DIST_CERT_PASSWORD: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE: ${{ secrets.IOS_PROVISIONING_PROFILE }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          printf '%s' "$IOS_DIST_CERT_P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -k "$keychain" -P "$IOS_DIST_CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security > /dev/null
+          rm "$RUNNER_TEMP/dist.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+
+          profile="$RUNNER_TEMP/mola.mobileprovision"
+          printf '%s' "$IOS_PROVISIONING_PROFILE" | base64 --decode > "$profile"
+          security cms -D -i "$profile" > "$RUNNER_TEMP/profile.plist"
+          uuid="$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")"
+          name="$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")"
+          app_id="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$RUNNER_TEMP/profile.plist")"
+          for dir in "$HOME/Library/MobileDevice/Provisioning Profiles" "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            mkdir -p "$dir"
+            cp "$profile" "$dir/$uuid.mobileprovision"
+          done
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+          echo "profile_name=$name" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=${app_id#*.}" >> "$GITHUB_OUTPUT"
+          if [ "$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.carplay-video' "$RUNNER_TEMP/profile.plist" 2> /dev/null)" = "true" ]; then
+            echo "carplay=YES" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Profilde CarPlay Video yetkisi yok: CarPlay yetkisi olmadan arşivleniyor."
+            echo "carplay=NO" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Arşivle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          PROFILE_NAME: ${{ steps.install.outputs.profile_name }}
+          BUNDLE_ID: ${{ steps.install.outputs.bundle_id }}
+          KEYCHAIN: ${{ steps.install.outputs.keychain }}
+          MOLA_CARPLAY: ${{ steps.install.outputs.carplay }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -o pipefail
+          build_number=$(MOLA_BUNDLE_ID="$BUNDLE_ID" node scripts/next-build-number.mjs)
+          xcodebuild archive -quiet -project Mola.xcodeproj -scheme Mola -configuration Release \
+            -destination generic/platform=iOS -archivePath "$RUNNER_TEMP/Mola.xcarchive" \
+            CURRENT_PROJECT_VERSION="$build_number" MOLA_BUNDLE_ID="$BUNDLE_ID" MOLA_TEAM_ID="$APPLE_TEAM_ID" \
+            MOLA_PROFILE_NAME="$PROFILE_NAME" MOLA_CARPLAY="$MOLA_CARPLAY" OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN"
+          echo "Archived build $build_number"
+
+      - name: TestFlight'a yükle
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          PROFILE_NAME: ${{ steps.install.outputs.profile_name }}
+          BUNDLE_ID: ${{ steps.install.outputs.bundle_id }}
+        run: |
+          key="$RUNNER_TEMP/AuthKey_$ASC_KEY_ID.p8"
+          printf '%s\n' "$ASC_KEY_P8" > "$key"
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key>
+            <dict><key>$BUNDLE_ID</key><string>$PROFILE_NAME</string></dict>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/Mola.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" -exportPath "$RUNNER_TEMP/export" \
+            -authenticationKeyPath "$key" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          rm "$key"
+
+      - name: İmza keychain'ini sil
+        if: always() && steps.install.outputs.keychain != ''
+        run: security delete-keychain "${{ steps.install.outputs.keychain }}"
